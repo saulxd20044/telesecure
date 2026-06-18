@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- =====================================================================
+  midpoint-config.xml — Proyecto TeleSecure, Fase 3
+  Configuración de midPoint 4.3 para disparar el webhook de
+  aprovisionamiento al asignar/retirar el rol "AgenteCallCenter".
+
+  Contiene DOS objetos (importar ambos desde la consola de midPoint:
+  Configuración -> Importar objeto -> pegar XML, o por archivos
+  separados si se prefiere):
+
+    1. <role>  AgenteCallCenter, con una regla de política que emite
+       un evento de notificación cuando la asignación del rol cambia.
+    2. Fragmento de <systemConfiguration> con un notificador custom
+       (Groovy) que convierte ese evento en un HTTP POST al webhook.
+
+  Mecanismo elegido: "policy rule + custom notifier". Es el patrón
+  nativo de midPoint para reaccionar a cambios de asignación con
+  lógica propia, sin desarrollar un conector ConnId completo.
+====================================================================== -->
+<objects xmlns="http://midpoint.evolveum.com/xml/ns/public/common/common-3"
+         xmlns:q="http://prism.evolveum.com/xml/ns/public/query-3">
+
+  <!-- ===================================================================
+       OBJETO 1: ROL AgenteCallCenter
+       OID fijo para poder referenciarlo desde scripts y filtros.
+  ==================================================================== -->
+  <role oid="aabbccdd-1111-2222-3333-tele00000001">
+    <name>AgenteCallCenter</name>
+    <description>
+      Rol funcional de agente de call center. Su asignación dispara el
+      aprovisionamiento automático de una extensión SIP en FreePBX a
+      través del webhook (ISO 27001 A.5.16 / A.5.18).
+    </description>
+
+    <!-- Regla de política: detecta ALTA de la asignación de este rol -->
+    <assignment>
+      <policyRule>
+        <name>notificar-alta-agente</name>
+        <policyConstraints>
+          <assignment>
+            <operation>add</operation>
+          </assignment>
+        </policyConstraints>
+        <policyActions>
+          <notification>
+            <handler>
+              <!-- Encadena con el notificador custom del systemConfig -->
+              <generalNotifier>
+                <category>policyRuleEvent</category>
+                <transport>webhookTelesecure</transport>
+              </generalNotifier>
+            </handler>
+          </notification>
+        </policyActions>
+      </policyRule>
+    </assignment>
+
+    <!-- Regla de política: detecta BAJA de la asignación (retiro de rol) -->
+    <assignment>
+      <policyRule>
+        <name>notificar-baja-agente</name>
+        <policyConstraints>
+          <assignment>
+            <operation>delete</operation>
+          </assignment>
+        </policyConstraints>
+        <policyActions>
+          <notification>
+            <handler>
+              <generalNotifier>
+                <category>policyRuleEvent</category>
+                <transport>webhookTelesecure</transport>
+              </generalNotifier>
+            </handler>
+          </notification>
+        </policyActions>
+      </policyRule>
+    </assignment>
+  </role>
+
+  <!-- ===================================================================
+       OBJETO 2: systemConfiguration (FRAGMENTO)
+       Fusionar dentro del systemConfiguration existente
+       (oid 00000000-0000-0000-0000-000000000001) en la sección
+       <notificationConfiguration>.
+
+       Define:
+         - Un notificador custom (Groovy) que arma el JSON y decide
+           /provision o /deprovision según la operación.
+         - El "transport" custom 'webhookTelesecure' que realiza el
+           HTTP POST con el token de autenticación.
+  ==================================================================== -->
+  <systemConfiguration oid="00000000-0000-0000-0000-000000000001">
+    <name>SystemConfiguration</name>
+    <notificationConfiguration>
+
+      <handler>
+        <customNotifier>
+          <name>webhook-freepbx-aprovisionamiento</name>
+          <!-- Solo eventos del rol AgenteCallCenter -->
+          <expressionFilter>
+            <script>
+              <code>
+                return event.isRelatedToItem(
+                    midpoint.prismContext.path("assignment")) &amp;&amp;
+                  event.getRequesteeObject() != null
+              </code>
+            </script>
+          </expressionFilter>
+          <transport>webhookTelesecure</transport>
+          <expression>
+            <script>
+              <language>http://midpoint.evolveum.com/xml/ns/public/expression/language#Groovy</language>
+              <code><![CDATA[
+                import com.evolveum.midpoint.notifications.api.transports.Message
+
+                def usuario = event.getRequesteeObject()
+                def oid     = usuario?.getOid()
+                def nombre  = usuario?.getFullName()?.getOrig() ?: usuario?.getName()?.getOrig()
+                def correo  = usuario?.getEmailAddress()
+
+                // ¿Es alta o baja del rol? (según la operación del evento)
+                def esBaja  = event.isDelete()
+                def destino = esBaja ? "/deprovision" : "/provision"
+
+                def json = groovy.json.JsonOutput.toJson([
+                    oid    : oid,
+                    nombre : nombre,
+                    correo : correo
+                ])
+
+                def msg = new Message()
+                msg.setBody(json)
+                msg.setSubject(destino)   // El transport usa el subject como ruta
+                msg.setTo(["webhook"])
+                return msg
+              ]]></code>
+            </script>
+          </expression>
+        </customNotifier>
+      </handler>
+
+      <!-- Transport custom: ejecuta el POST real hacia el webhook -->
+      <customTransport>
+        <name>webhookTelesecure</name>
+        <expression>
+          <script>
+            <language>http://midpoint.evolveum.com/xml/ns/public/expression/language#Groovy</language>
+            <code><![CDATA[
+              // message.subject = ruta (/provision | /deprovision)
+              // message.body    = payload JSON
+              def base  = "http://webhook:5000"           // resoluble por red_gestion
+              def token = "e228111abf729700c4934bc2b7e36701b5fc8859419619a5"          // = WEBHOOK_TOKEN del .env
+
+              def url  = new URL(base + message.getSubject())
+              def conn = url.openConnection()
+              conn.setRequestMethod("POST")
+              conn.setDoOutput(true)
+              conn.setConnectTimeout(5000)
+              conn.setReadTimeout(150000)                  // fwconsole reload tarda
+              conn.setRequestProperty("Content-Type", "application/json")
+              conn.setRequestProperty("X-Auth-Token", token)
+              conn.getOutputStream().withWriter("UTF-8") { it << message.getBody() }
+
+              def codigo = conn.getResponseCode()
+              if (codigo >= 300) {
+                  throw new IllegalStateException(
+                      "Webhook respondió HTTP " + codigo)
+              }
+            ]]></code>
+          </script>
+        </expression>
+      </customTransport>
+
+    </notificationConfiguration>
+  </systemConfiguration>
+
+</objects>

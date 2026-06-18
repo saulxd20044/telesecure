@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Rol "AgenteCallCenter" para TeleSecure (midPoint 4.10).
+  OID fijo: a0000000-0000-0000-0000-00000000ca11
+  (el notificador filtra por este OID para disparar el webhook)
+
+  Importar en: Roles -> New Role -> pestaña XML/JSON -> pegar -> Save
+  o vía ninja/REST.
+-->
+<role xmlns="http://midpoint.evolveum.com/xml/ns/public/common/common-3"
+      oid="a0000000-0000-0000-0000-00000000ca11">
+    <name>AgenteCallCenter</name>
+    <description>
+        Rol de negocio que habilita a un usuario como agente de call center.
+        Al asignarse, el notificador 'telesecure-aprovisionar-extension'
+        dispara el webhook que crea la extensión SIP en FreePBX.
+    </description>
+    <displayName>Agente de Call Center</displayName>
+    <identifier>AGENTE_CALLCENTER</identifier>
+    <activation>
+        <administrativeStatus>enabled</administrativeStatus>
+    </activation>
+</role>

@@ -1,0 +1,23 @@
+                        import java.net.URL
+                        import java.net.HttpURLConnection
+
+                        def cuerpo = message.getBody()
+                        def url = new URL('http://telesecure_webhook:5000/provision')
+                        def conn = (HttpURLConnection) url.openConnection()
+                        conn.setRequestMethod('POST')
+                        conn.setConnectTimeout(10000)
+                        conn.setReadTimeout(120000)
+                        conn.setDoOutput(true)
+                        conn.setRequestProperty('Content-Type', 'application/json')
+                        conn.setRequestProperty('X-Auth-Token', 'e228111abf729700c4934bc2b7e36701b5fc8859419619a5')
+
+                        conn.getOutputStream().withWriter('UTF-8') { it.write(cuerpo) }
+
+                        def codigo = conn.getResponseCode()
+                        def stream = (codigo &gt;= 400) ? conn.getErrorStream() : conn.getInputStream()
+                        def respuesta = stream?.getText('UTF-8') ?: ''
+                        LOGGER.info('TeleSecure webhook HTTP {} -&gt; {}', codigo, respuesta)
+                        conn.disconnect()
+                        if (codigo &gt;= 400) {
+                            throw new RuntimeException('Webhook error HTTP ' + codigo + ': ' + respuesta)
+                        }

@@ -1,0 +1,113 @@
+<!--
+  ============================================================================
+  TeleSecure - Disparador automático midPoint 4.10 -> Webhook FreePBX
+  ============================================================================
+  Este fragmento se PEGA dentro del objeto System Configuration de midPoint,
+  en la sección <notificationConfiguration>. Cuando un usuario recibe el rol
+  "AgenteCallCenter", midPoint ejecuta el script Groovy que hace POST al
+  webhook /provision, creando la extensión SIP automáticamente.
+
+  Compatibilidad: midPoint 4.10.x (sintaxis generalNotifier + customTransport).
+  ============================================================================
+-->
+<notificationConfiguration>
+    <handler>
+        <generalNotifier>
+            <name>telesecure-aprovisionar-extension</name>
+
+            <!-- FILTRO: solo dispara cuando el evento es la ASIGNACIÓN exitosa
+                 del rol AgenteCallCenter a un usuario (UserType). -->
+            <expressionFilter>
+                <script>
+                    <code>
+                        import com.evolveum.midpoint.notifications.api.events.ModelEvent
+                        import com.evolveum.midpoint.xml.ns._public.common.common_3.UserType
+                        import com.evolveum.midpoint.xml.ns._public.common.common_3.AssignmentType
+
+                        // Solo eventos de modelo, exitosos, sobre usuarios
+                        if (!(event instanceof ModelEvent)) return false
+                        if (!event.isSuccess()) return false
+                        def fc = event.getFocusContext()
+                        if (fc == null) return false
+                        if (!UserType.class.isAssignableFrom(fc.getObjectTypeClass())) return false
+
+                        // ¿El usuario tiene asignado el rol AgenteCallCenter?
+                        def user = event.getFocusContext().getObjectNew()?.asObjectable()
+                        if (user == null) return false
+                        boolean tieneRol = user.getAssignment().any { AssignmentType a ->
+                            a.getTargetRef() != null &amp;&amp;
+                            a.getTargetRef().getOid() == 'a0000000-0000-0000-0000-00000000ca11'
+                        }
+                        return tieneRol
+                    </code>
+                </script>
+            </expressionFilter>
+
+            <!-- Destinatario simbólico (requerido por el notifier aunque usemos
+                 transporte HTTP custom; el webhook no usa email). -->
+            <recipientExpression>
+                <value>webhook@telesecure.local</value>
+            </recipientExpression>
+
+            <!-- El "cuerpo" del mensaje es el JSON que recibirá el webhook. -->
+            <bodyExpression>
+                <script>
+                    <code>
+                        def user = event.getFocusContext().getObjectNew()?.asObjectable()
+                        def oid = user.getOid()
+                        def nombre = (user.getFullName() != null) ? user.getFullName().getOrig() : user.getName().getOrig()
+                        def correo = (user.getEmailAddress() != null) ? user.getEmailAddress() : ''
+                        // JSON que espera /provision
+                        return groovy.json.JsonOutput.toJson([
+                            oid    : oid,
+                            nombre : nombre,
+                            correo : correo
+                        ])
+                    </code>
+                </script>
+            </bodyExpression>
+
+            <!-- Usar el transporte custom 'telesecure-webhook' definido abajo. -->
+            <transport>telesecure-webhook</transport>
+        </generalNotifier>
+    </handler>
+
+    <!-- TRANSPORTE CUSTOM: ejecuta una llamada HTTP POST al webhook.
+         En 4.10 el customTransport corre un script Groovy donde 'message'
+         es el NotificationMessage (message.body = JSON de arriba). -->
+    <customTransport>
+        <name>telesecure-webhook</name>
+        <expression>
+            <script>
+                <code>
+                    import java.net.http.HttpClient
+                    import java.net.http.HttpRequest
+                    import java.net.http.HttpResponse
+                    import java.net.URI
+                    import java.time.Duration
+
+                    def cuerpo = message.getBody()
+
+                    def client = HttpClient.newBuilder()
+                        .connectTimeout(Duration.ofSeconds(10))
+                        .build()
+
+                    def request = HttpRequest.newBuilder()
+                        .uri(URI.create('http://telesecure_webhook:5000/provision'))
+                        .timeout(Duration.ofSeconds(120))
+                        .header('Content-Type', 'application/json')
+                        .header('X-Auth-Token', 'e228111abf729700c4934bc2b7e36701b5fc8859419619a5')
+                        .POST(HttpRequest.BodyPublishers.ofString(cuerpo))
+                        .build()
+
+                    def response = client.send(request, HttpResponse.BodyHandlers.ofString())
+                    LOGGER.info('TeleSecure webhook respondió HTTP {} : {}', response.statusCode(), response.body())
+
+                    if (response.statusCode() &gt;= 400) {
+                        throw new RuntimeException('Webhook devolvió error HTTP ' + response.statusCode() + ': ' + response.body())
+                    }
+                </code>
+            </script>
+        </expression>
+    </customTransport>
+</notificationConfiguration>

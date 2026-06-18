@@ -1,0 +1,268 @@
+# =====================================================================
+# Proyecto TeleSecure — docker-compose.yml UNIFICADO
+# Integra: MariaDB 10.6 + midPoint 4.3 (IAM) + FreePBX (PBX) + Webhook
+#
+# Reúne en un solo archivo el resultado de las fases 2 y 3:
+#   - Base de datos central con bases y usuarios segregados (init.sql)
+#   - midPoint para el gobierno de identidades
+#   - FreePBX con base de datos externa (DB_EMBEDDED=FALSE)
+#   - Webhook Python que aprovisiona extensiones SIP al asignar el rol
+#
+# Redes segmentadas (ISO 27001 A.8.20/A.8.22):
+#   red_datos   -> internal:true, aísla la BD del exterior
+#   red_voz     -> tráfico SIP/RTP
+#   red_gestion -> canal midPoint -> webhook -> FreePBX
+#
+# Arranque:  docker compose up -d --build
+# =====================================================================
+
+services:
+
+  # -------------------------------------------------------------------
+  # 1) BASE DE DATOS CENTRAL — MariaDB 10.6
+  # -------------------------------------------------------------------
+  db:
+    image: mariadb:10.6
+    container_name: telesecure_db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-RootCambiar123!}
+      TZ: America/Lima
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --sql-mode=                     # FreePBX requiere modo relajado
+    volumes:
+      - db_data:/var/lib/mysql
+      # init.sql SOLO se ejecuta en el primer arranque (volumen vacío)
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    networks:
+      - red_datos
+    expose:
+      - "3306"                          # Visible solo dentro de red_datos
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # -------------------------------------------------------------------
+  # 2) midPoint — Gestión de Identidades y Accesos (IAM)
+  # -------------------------------------------------------------------
+  # 2a) PostgreSQL exclusivo de midPoint (la imagen oficial lo requiere)
+  # -------------------------------------------------------------------
+  midpoint_data:
+    image: postgres:16-alpine
+    container_name: telesecure_midpoint_data
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: midpoint
+      POSTGRES_USER: midpoint
+      POSTGRES_PASSWORD: ${MIDPOINT_DB_PASSWORD:-MidpointCambiar123!}
+      TZ: America/Lima
+    volumes:
+      - midpoint_pgdata:/var/lib/postgresql/data
+    networks:
+      - red_datos
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U midpoint -d midpoint"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------
+  # 2b) Inicializador del repositorio de midPoint (corre y termina)
+  # -------------------------------------------------------------------
+  midpoint_init:
+    image: evolveum/midpoint:latest-alpine
+    container_name: telesecure_midpoint_init
+    depends_on:
+      midpoint_data:
+        condition: service_healthy
+    command: >
+      bash -c "
+      cd /opt/midpoint ;
+      bin/midpoint.sh init-native ;
+      echo ' - - - - - - ' ;
+      bin/ninja.sh -B info >/dev/null 2>/tmp/ninja.log ;
+      grep -q 'ERROR' /tmp/ninja.log && (
+      bin/ninja.sh run-sql --create --mode REPOSITORY ;
+      bin/ninja.sh run-sql --create --mode AUDIT
+      ) ||
+      echo 'Repositorio ya inicializado, nada que hacer' ;
+      "
+    environment:
+      - MP_SET_midpoint_repository_jdbcUsername=midpoint
+      - MP_SET_midpoint_repository_jdbcPassword=${MIDPOINT_DB_PASSWORD:-MidpointCambiar123!}
+      - MP_SET_midpoint_repository_jdbcUrl=jdbc:postgresql://midpoint_data:5432/midpoint
+      - MP_SET_midpoint_repository_database=postgresql
+      - MP_INIT_CFG=/opt/midpoint/var
+    networks:
+      - red_datos
+
+  # -------------------------------------------------------------------
+  # 2c) midPoint — Gestión de Identidades y Accesos (IAM)
+  # -------------------------------------------------------------------
+  midpoint:
+    image: evolveum/midpoint:latest-alpine
+    container_name: telesecure_midpoint
+    restart: unless-stopped
+    depends_on:
+      midpoint_data:
+        condition: service_healthy
+      midpoint_init:
+        condition: service_completed_successfully
+    command: [ "/opt/midpoint/bin/midpoint.sh", "container" ]
+    environment:
+      - MP_SET_midpoint_repository_jdbcUsername=midpoint
+      - MP_SET_midpoint_repository_jdbcPassword=${MIDPOINT_DB_PASSWORD:-MidpointCambiar123!}
+      - MP_SET_midpoint_repository_jdbcUrl=jdbc:postgresql://midpoint_data:5432/midpoint
+      - MP_SET_midpoint_repository_database=postgresql
+      - MP_SET_midpoint_administrator_initialPassword=Telesecure5ecr3t
+      - MP_UNSET_midpoint_repository_hibernateHbm2ddl=1
+      - MP_NO_ENV_COMPAT=1
+      - TZ=America/Lima
+    ports:
+      - "8081:8080"                     # http://localhost:8081/midpoint (8080 lo usa GLPI)
+    volumes:
+      - midpoint_home_v4:/opt/midpoint/var
+    networks:
+      - red_datos
+      - red_gestion
+
+  # -------------------------------------------------------------------
+  # 3) FreePBX — Central telefónica con GUI (base de datos externa)
+  # -------------------------------------------------------------------
+  freepbx:
+    image: blacksunsolutions/freepbx:latest   # FreePBX 17 (BD externa)
+    container_name: telesecure_freepbx
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TZ: America/Lima
+      # --- Conexion a la MariaDB central (bases creadas por init.sql) ---
+      DBENGINE: mysql
+      DBHOST: db                        # nombre del servicio (DNS de Docker)
+      DBPORT: "3306"
+      DBNAME: asterisk
+      CDRDBNAME: asteriskcdrdb
+      DBUSER: ${FREEPBX_DB_USER:-fpbx_user}
+      DBPASS: ${FREEPBX_DB_PASSWORD:-FreepbxCambiar123!}
+      DB_USER: ${FREEPBX_DB_USER:-fpbx_user}    # la imagen usa ambas formas
+      DB_PASS: ${FREEPBX_DB_PASSWORD:-FreepbxCambiar123!}
+      # --- Rutas internas que la imagen "clear build" requiere ---
+      USER: asterisk
+      GROUP: asterisk
+      WEBROOT: /var/www/html
+      ASTETCDIR: /etc/asterisk
+      ASTMODDIR: /usr/lib64/asterisk/modules
+      ASTVARLIBDIR: /var/lib/asterisk
+      ASTAGIDIR: /var/lib/asterisk/agi-bin
+      ASTSPOOLDIR: /var/spool/asterisk
+      ASTRUNDIR: /var/run/asterisk
+      AMPBIN: /var/lib/asterisk/bin
+      AMPSBIN: /usr/sbin
+      AMPCGIBIN: /var/www/cgi-bin
+      AMPPLAYBACK: /var/lib/asterisk/playback
+    ports:
+      - "8090:80"                       # GUI HTTP  (8090 para no chocar con GLPI)
+      - "8443:443"                      # GUI HTTPS
+      - "5060:5060/udp"                 # SIP
+      - "5060:5060/tcp"
+      - "5061:5061/tcp"                 # SIP sobre TLS (Fase 4)
+      - "10000-10100:10000-10100/udp"   # RTP acotado
+    volumes:
+      - freepbx_varlib:/var/lib/asterisk
+      - freepbx_etc:/etc/asterisk
+      - freepbx_usrlib:/usr/lib64/asterisk
+      - freepbx_logs:/var/log/asterisk
+      - freepbx_www:/var/www/html
+    networks:
+      - red_datos
+      - red_voz
+      - red_gestion
+    healthcheck:
+      # fwconsole es la CLI de FreePBX; si responde, el sistema esta operativo
+      test: ["CMD-SHELL", "fwconsole --version > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+
+  # -------------------------------------------------------------------
+  # 4) WEBHOOK — Conector de aprovisionamiento midPoint -> FreePBX
+  # -------------------------------------------------------------------
+  webhook:
+    build:
+      context: ./webhook
+    container_name: telesecure_webhook
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      freepbx:
+        condition: service_started
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      WEBHOOK_DB_USER: ${MIDPOINT_DB_USER:-mp_user}
+      WEBHOOK_DB_PASSWORD: ${MIDPOINT_DB_PASSWORD:-MidpointCambiar123!}
+      WEBHOOK_TOKEN: ${WEBHOOK_TOKEN:-CAMBIAR_TOKEN_WEBHOOK}
+      FREEPBX_CONTAINER: telesecure_freepbx
+      # API GraphQL de FreePBX (forma soportada de crear extensiones)
+      FREEPBX_API_BASE: http://telesecure_freepbx
+      FREEPBX_CLIENT_ID: ${FREEPBX_CLIENT_ID:-}
+      FREEPBX_CLIENT_SECRET: ${FREEPBX_CLIENT_SECRET:-}
+    volumes:
+      # Necesario para `docker exec ... fwconsole reload`.
+      # RIESGO DOCUMENTADO: el socket da control del daemon Docker.
+      # Aceptable en laboratorio; en producción usar la API de FreePBX.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - red_datos
+      - red_gestion
+    # Sin puertos al host: solo midPoint lo alcanza por red_gestion
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:5000/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+# =====================================================================
+# REDES SEGMENTADAS
+# =====================================================================
+networks:
+  red_datos:
+    driver: bridge
+    internal: true
+    name: telesecure_red_datos
+  red_voz:
+    driver: bridge
+    name: telesecure_red_voz
+  red_gestion:
+    driver: bridge
+    name: telesecure_red_gestion
+
+# =====================================================================
+# VOLÚMENES PERSISTENTES
+# =====================================================================
+volumes:
+  db_data:
+    name: telesecure_db_data
+  midpoint_home_v4:
+    name: telesecure_midpoint_home_v4
+  midpoint_pgdata:
+    name: telesecure_midpoint_pgdata
+  freepbx_varlib:
+    name: telesecure_freepbx_varlib
+  freepbx_etc:
+    name: telesecure_freepbx_etc
+  freepbx_usrlib:
+    name: telesecure_freepbx_usrlib
+  freepbx_www:
+    name: telesecure_freepbx_www
+  freepbx_logs:
+    name: telesecure_freepbx_logs

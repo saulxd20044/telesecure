@@ -1,0 +1,86 @@
+<!-- ====================================================================
+     VERSIÓN CORREGIDA para midPoint 4.10
+     El customTransport va en messageTransportConfiguration (sección
+     separada), NO dentro de notificationConfiguration.
+
+     Reemplaza el bloque <notificationConfiguration>...</notificationConfiguration>
+     que insertaste antes por ESTOS DOS bloques.
+     ==================================================================== -->
+
+<messageTransportConfiguration>
+    <customTransport>
+        <name>telesecure-webhook</name>
+        <expression>
+            <script>
+                <code>
+                    import java.net.http.HttpClient
+                    import java.net.http.HttpRequest
+                    import java.net.http.HttpResponse
+                    import java.net.URI
+                    import java.time.Duration
+
+                    def cuerpo = message.getBody()
+                    def client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
+                    def request = HttpRequest.newBuilder()
+                        .uri(URI.create('http://telesecure_webhook:5000/provision'))
+                        .timeout(Duration.ofSeconds(120))
+                        .header('Content-Type', 'application/json')
+                        .header('X-Auth-Token', 'e228111abf729700c4934bc2b7e36701b5fc8859419619a5')
+                        .POST(HttpRequest.BodyPublishers.ofString(cuerpo))
+                        .build()
+                    def response = client.send(request, HttpResponse.BodyHandlers.ofString())
+                    LOGGER.info('TeleSecure webhook HTTP {} -> {}', response.statusCode(), response.body())
+                    if (response.statusCode() &gt;= 400) {
+                        throw new RuntimeException('Webhook error HTTP ' + response.statusCode() + ': ' + response.body())
+                    }
+                </code>
+            </script>
+        </expression>
+    </customTransport>
+</messageTransportConfiguration>
+
+<notificationConfiguration>
+    <handler>
+        <generalNotifier>
+            <name>telesecure-aprovisionar-extension</name>
+            <expressionFilter>
+                <script>
+                    <code>
+                        import com.evolveum.midpoint.notifications.api.events.ModelEvent
+                        import com.evolveum.midpoint.xml.ns._public.common.common_3.AssignmentType
+
+                        if (!(event instanceof ModelEvent)) return false
+                        if (!event.isSuccess()) return false
+                        if (!event.isUserRelated()) return false
+                        if (!event.isAdd() &amp;&amp; !event.isModify()) return false
+
+                        def user = event.getRequesteeObject()
+                        if (user == null) return false
+
+                        boolean tieneRol = user.getAssignment().any { AssignmentType a ->
+                            a.getTargetRef() != null &amp;&amp;
+                            a.getTargetRef().getOid() == 'a0000000-0000-0000-0000-00000000ca11'
+                        }
+                        return tieneRol
+                    </code>
+                </script>
+            </expressionFilter>
+            <recipientExpression>
+                <value>webhook@telesecure.local</value>
+            </recipientExpression>
+            <bodyExpression>
+                <script>
+                    <code>
+                        import groovy.json.JsonOutput
+                        def user = event.getRequesteeObject()
+                        def oid = user.getOid()
+                        def nombre = (user.getFullName() != null) ? user.getFullName().getOrig() : user.getName().getOrig()
+                        def correo = (user.getEmailAddress() != null) ? user.getEmailAddress() : ''
+                        return JsonOutput.toJson([ oid: oid, nombre: nombre, correo: correo ])
+                    </code>
+                </script>
+            </bodyExpression>
+            <transport>telesecure-webhook</transport>
+        </generalNotifier>
+    </handler>
+</notificationConfiguration>

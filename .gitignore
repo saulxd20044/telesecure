@@ -1,0 +1,5 @@
+.env
+*.log
+evidencia/
+__pycache__/
+*.pyc

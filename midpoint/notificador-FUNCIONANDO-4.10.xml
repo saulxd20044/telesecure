@@ -1,0 +1,87 @@
+<!-- ============================================================
+     DISPARADOR midPoint 4.10 -> Webhook TeleSecure  [FUNCIONANDO]
+     Clave: toda la logica va DENTRO del customTransport (event
+     esta disponible ahi). Se usa event.requestee.resolveObjectType()
+     para obtener el UserType completo (OID, nombre, email).
+     ============================================================ -->
+
+<notificationConfiguration>
+    <handler>
+        <generalNotifier>
+            <name>telesecure-aprovisionar-extension</name>
+            <expressionFilter>
+                <script>
+                    <objectVariableMode>object</objectVariableMode>
+                    <code>
+                        import com.evolveum.midpoint.notifications.api.events.ModelEvent
+                        import com.evolveum.midpoint.xml.ns._public.common.common_3.AssignmentType
+
+                        if (!(event instanceof ModelEvent)) return false
+                        if (!event.isSuccess()) return false
+                        if (!event.isUserRelated()) return false
+                        if (!event.isAdd() &amp;&amp; !event.isModify()) return false
+
+                        def user = event.getRequesteeObject()
+                        if (user == null) return false
+
+                        boolean tieneRol = user.getAssignment().any { AssignmentType a -&gt;
+                            a.getTargetRef() != null &amp;&amp;
+                            a.getTargetRef().getOid() == 'a0000000-0000-0000-0000-00000000ca11'
+                        }
+                        return tieneRol
+                    </code>
+                </script>
+            </expressionFilter>
+            <recipientExpression>
+                <value>webhook@telesecure.local</value>
+            </recipientExpression>
+            <bodyExpression>
+                <value>trigger</value>
+            </bodyExpression>
+            <transport>telesecure-webhook</transport>
+        </generalNotifier>
+    </handler>
+</notificationConfiguration>
+<messageTransportConfiguration>
+    <customTransport>
+        <name>telesecure-webhook</name>
+        <expression>
+            <script>
+                <code>
+                    import groovy.json.JsonOutput
+                    import java.net.URL
+                    import java.net.HttpURLConnection
+
+                    def oid = ''
+                    def nombre = 'Agente'
+                    def correo = ''
+                    def u = event.requestee?.resolveObjectType()
+                    if (u != null) {
+                        oid = u.getOid() ?: ''
+                        if (u.getName() != null) nombre = u.getName().getOrig()
+                        if (u.getFullName() != null) nombre = u.getFullName().getOrig()
+                        if (u.getEmailAddress() != null) correo = u.getEmailAddress()
+                    }
+                    def cuerpo = JsonOutput.toJson([ oid: oid, nombre: nombre, correo: correo ])
+
+                    def url = new URL('http://telesecure_webhook:5000/provision')
+                    def conn = (HttpURLConnection) url.openConnection()
+                    conn.setRequestMethod('POST')
+                    conn.setConnectTimeout(10000)
+                    conn.setReadTimeout(120000)
+                    conn.setDoOutput(true)
+                    conn.setRequestProperty('Content-Type', 'application/json')
+                    conn.setRequestProperty('X-Auth-Token', 'e228111abf729700c4934bc2b7e36701b5fc8859419619a5')
+                    conn.getOutputStream().withWriter('UTF-8') { it.write(cuerpo) }
+                    def codigo = conn.getResponseCode()
+                    def stream = (codigo &gt;= 400) ? conn.getErrorStream() : conn.getInputStream()
+                    def respuesta = stream?.getText('UTF-8') ?: ''
+                    conn.disconnect()
+                    if (codigo &gt;= 400) {
+                        throw new RuntimeException('Webhook error HTTP ' + codigo + ': ' + respuesta)
+                    }
+                </code>
+            </script>
+        </expression>
+    </customTransport>
+</messageTransportConfiguration>

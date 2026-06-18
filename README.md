@@ -166,10 +166,3 @@ docker exec telesecure_freepbx asterisk -rx "pjsip show endpoint 1001"  # media_
 - **Certificado TLS autofirmado:** válido para laboratorio; producción usaría una CA
   reconocida (Let's Encrypt, soportado por la misma pantalla de FreePBX).
 
----
-
-## 9. Seguridad del repositorio
-
-⚠️ El `.env`, `keystore_password.txt` y `repo_password.txt` contienen credenciales
-de **laboratorio**. El `.gitignore` ya excluye `.env`. **No publiques credenciales
-reales en repositorios públicos.**

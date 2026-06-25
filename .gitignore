@@ -3,3 +3,4 @@
 evidencia/
 __pycache__/
 *.pyc
+*.bak

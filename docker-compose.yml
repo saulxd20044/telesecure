@@ -1,19 +1,12 @@
 # =====================================================================
-# Proyecto TeleSecure — docker-compose.yml UNIFICADO
-# Integra: MariaDB 10.6 + midPoint 4.3 (IAM) + FreePBX (PBX) + Webhook
+# Proyecto TeleSecure — docker-compose.yml  (VERSION VM LINUX)
+# Ajustado para network_mode: host en FreePBX -> el audio RTP funciona.
 #
-# Reúne en un solo archivo el resultado de las fases 2 y 3:
-#   - Base de datos central con bases y usuarios segregados (init.sql)
-#   - midPoint para el gobierno de identidades
-#   - FreePBX con base de datos externa (DB_EMBEDDED=FALSE)
-#   - Webhook Python que aprovisiona extensiones SIP al asignar el rol
-#
-# Redes segmentadas (ISO 27001 A.8.20/A.8.22):
-#   red_datos   -> internal:true, aísla la BD del exterior
-#   red_voz     -> tráfico SIP/RTP
-#   red_gestion -> canal midPoint -> webhook -> FreePBX
-#
-# Arranque:  docker compose up -d --build
+# Cambios respecto a la version Windows:
+#   - FreePBX usa network_mode: host (sin ports ni networks propias)
+#   - FreePBX se conecta a la BD por 127.0.0.1 (DBHOST), via puerto publicado
+#   - La BD publica 3306 al host para que FreePBX la alcance
+#   - El webhook apunta a FreePBX por la IP de la VM
 # =====================================================================
 
 services:
@@ -31,15 +24,14 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
-      - --sql-mode=                     # FreePBX requiere modo relajado
+      - --sql-mode=
     volumes:
       - db_data:/var/lib/mysql
-      # init.sql SOLO se ejecuta en el primer arranque (volumen vacío)
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     networks:
       - red_datos
-    expose:
-      - "3306"                          # Visible solo dentro de red_datos
+    ports:
+      - "127.0.0.1:3306:3306"           # publicado SOLO a localhost (FreePBX host-net lo alcanza)
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
@@ -48,9 +40,7 @@ services:
       start_period: 30s
 
   # -------------------------------------------------------------------
-  # 2) midPoint — Gestión de Identidades y Accesos (IAM)
-  # -------------------------------------------------------------------
-  # 2a) PostgreSQL exclusivo de midPoint (la imagen oficial lo requiere)
+  # 2a) PostgreSQL exclusivo de midPoint
   # -------------------------------------------------------------------
   midpoint_data:
     image: postgres:16-alpine
@@ -72,7 +62,7 @@ services:
       retries: 5
 
   # -------------------------------------------------------------------
-  # 2b) Inicializador del repositorio de midPoint (corre y termina)
+  # 2b) Inicializador del repositorio de midPoint
   # -------------------------------------------------------------------
   midpoint_init:
     image: evolveum/midpoint:latest-alpine
@@ -102,7 +92,7 @@ services:
       - red_datos
 
   # -------------------------------------------------------------------
-  # 2c) midPoint — Gestión de Identidades y Accesos (IAM)
+  # 2c) midPoint (IAM)
   # -------------------------------------------------------------------
   midpoint:
     image: evolveum/midpoint:latest-alpine
@@ -124,7 +114,7 @@ services:
       - MP_NO_ENV_COMPAT=1
       - TZ=America/Lima
     ports:
-      - "8081:8080"                     # http://localhost:8081/midpoint (8080 lo usa GLPI)
+      - "8081:8080"
     volumes:
       - midpoint_home_v4:/opt/midpoint/var
     networks:
@@ -132,28 +122,27 @@ services:
       - red_gestion
 
   # -------------------------------------------------------------------
-  # 3) FreePBX — Central telefónica con GUI (base de datos externa)
+  # 3) FreePBX — network_mode: host (CLAVE para el audio RTP)
   # -------------------------------------------------------------------
   freepbx:
-    image: blacksunsolutions/freepbx:latest   # FreePBX 17 (BD externa)
+    image: blacksunsolutions/freepbx:latest
     container_name: telesecure_freepbx
     restart: unless-stopped
+    network_mode: host                  # <<<<<< comparte la red de la VM directamente
     depends_on:
       db:
         condition: service_healthy
     environment:
       TZ: America/Lima
-      # --- Conexion a la MariaDB central (bases creadas por init.sql) ---
       DBENGINE: mysql
-      DBHOST: db                        # nombre del servicio (DNS de Docker)
+      DBHOST: 127.0.0.1                 # <<<<<< la BD se alcanza por localhost (puerto publicado)
       DBPORT: "3306"
       DBNAME: asterisk
       CDRDBNAME: asteriskcdrdb
       DBUSER: ${FREEPBX_DB_USER:-fpbx_user}
       DBPASS: ${FREEPBX_DB_PASSWORD:-FreepbxCambiar123!}
-      DB_USER: ${FREEPBX_DB_USER:-fpbx_user}    # la imagen usa ambas formas
+      DB_USER: ${FREEPBX_DB_USER:-fpbx_user}
       DB_PASS: ${FREEPBX_DB_PASSWORD:-FreepbxCambiar123!}
-      # --- Rutas internas que la imagen "clear build" requiere ---
       USER: asterisk
       GROUP: asterisk
       WEBROOT: /var/www/html
@@ -167,25 +156,15 @@ services:
       AMPSBIN: /usr/sbin
       AMPCGIBIN: /var/www/cgi-bin
       AMPPLAYBACK: /var/lib/asterisk/playback
-    ports:
-      - "8090:80"                       # GUI HTTP  (8090 para no chocar con GLPI)
-      - "8443:443"                      # GUI HTTPS
-      - "5060:5060/udp"                 # SIP
-      - "5060:5060/tcp"
-      - "5061:5061/tcp"                 # SIP sobre TLS (Fase 4)
-      - "10000-10100:10000-10100/udp"   # RTP acotado
+    # SIN 'ports:' — host networking expone los puertos directo en la VM
+    # SIN 'networks:' — comparte la red del host
     volumes:
       - freepbx_varlib:/var/lib/asterisk
       - freepbx_etc:/etc/asterisk
       - freepbx_usrlib:/usr/lib64/asterisk
       - freepbx_logs:/var/log/asterisk
       - freepbx_www:/var/www/html
-    networks:
-      - red_datos
-      - red_voz
-      - red_gestion
     healthcheck:
-      # fwconsole es la CLI de FreePBX; si responde, el sistema esta operativo
       test: ["CMD-SHELL", "fwconsole --version > /dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 10s
@@ -193,7 +172,7 @@ services:
       start_period: 300s
 
   # -------------------------------------------------------------------
-  # 4) WEBHOOK — Conector de aprovisionamiento midPoint -> FreePBX
+  # 4) WEBHOOK — Conector midPoint -> FreePBX
   # -------------------------------------------------------------------
   webhook:
     build:
@@ -212,19 +191,15 @@ services:
       WEBHOOK_DB_PASSWORD: ${MIDPOINT_DB_PASSWORD:-MidpointCambiar123!}
       WEBHOOK_TOKEN: ${WEBHOOK_TOKEN:-CAMBIAR_TOKEN_WEBHOOK}
       FREEPBX_CONTAINER: telesecure_freepbx
-      # API GraphQL de FreePBX (forma soportada de crear extensiones)
-      FREEPBX_API_BASE: http://telesecure_freepbx
+      # FreePBX esta en host networking -> se alcanza por la IP de la VM
+      FREEPBX_API_BASE: http://192.168.18.93
       FREEPBX_CLIENT_ID: ${FREEPBX_CLIENT_ID:-}
       FREEPBX_CLIENT_SECRET: ${FREEPBX_CLIENT_SECRET:-}
     volumes:
-      # Necesario para `docker exec ... fwconsole reload`.
-      # RIESGO DOCUMENTADO: el socket da control del daemon Docker.
-      # Aceptable en laboratorio; en producción usar la API de FreePBX.
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - red_datos
       - red_gestion
-    # Sin puertos al host: solo midPoint lo alcanza por red_gestion
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:5000/health')\""]
       interval: 30s
@@ -237,7 +212,6 @@ services:
 networks:
   red_datos:
     driver: bridge
-    internal: true
     name: telesecure_red_datos
   red_voz:
     driver: bridge

@@ -37,8 +37,13 @@ FLUJO DE PROVISIÓN:
      → fwconsole reload  →  Softphone se registra (TLS 5061) → llamada SRTP
 ```
 
-**Puertos del host:** FreePBX GUI `8090`, midPoint `8081`, SIP `5060/udp` y
-`5061/tls`, RTP `10000-10100`.
+**Puertos del host:** FreePBX GUI `80` (host networking en VM), midPoint `8081`,
+SIP `5060/udp` y `5061/tls`, RTP `10000-10100`.
+
+> **Despliegue recomendado: VM Linux.** El sistema corre en una VM Ubuntu donde
+> FreePBX usa `network_mode: host`. Esto resuelve el enrutamiento del audio RTP, que
+> no funciona en Docker Desktop sobre Windows/WSL2 (el docker-proxy reescribe las IPs
+> de origen). En la VM, la GUI de FreePBX queda en `http://IP_VM` (puerto 80 directo).
 
 ---
 
@@ -49,7 +54,7 @@ FLUJO DE PROVISIÓN:
 | `telesecure_db` | `mariadb:10.6` | BD de FreePBX | 3306 |
 | `telesecure_midpoint_data` | `postgres:16-alpine` | BD de midPoint (repositorio nativo) | 5432 |
 | `telesecure_midpoint` | `evolveum/midpoint:latest-alpine` | IAM / gestión de identidades | 8081 |
-| `telesecure_freepbx` | `blacksunsolutions/freepbx:latest` | PBX (Asterisk + GUI + API) | 8090 |
+| `telesecure_freepbx` | `blacksunsolutions/freepbx:latest` | PBX (Asterisk + GUI + API) | 80 (host net) |
 | `telesecure_webhook` | `telesecure-webhook` (build local) | Conector de aprovisionamiento | 5000 |
 
 > `telesecure_midpoint_init` corre una vez (inicializa el esquema de midPoint en
@@ -61,8 +66,10 @@ FLUJO DE PROVISIÓN:
 
 - Docker Engine ≥ 24.x y Docker Compose v2 (`docker compose version`).
 - **6 GB de RAM libres** mínimo (midPoint + FreePBX son exigentes).
-- Windows: Docker Desktop con WSL2.
-- Puertos libres en el host: `8090`, `8081`, `5060`, `5061`, `10000-10100`.
+- **VM Linux (recomendado):** Ubuntu 24.04 en VirtualBox con red en modo puente
+  (bridged), para que el audio RTP fluya vía `network_mode: host`. Detalle completo
+  en `docs/GUIA_MIGRACION_VM.md`.
+- Puertos libres en el host: `80`, `8081`, `5060`, `5061`, `10000-10100`.
 
 ---
 
@@ -90,22 +97,36 @@ docker compose ps           # esperar 5 contenedores healthy (init en exit 0)
 ```
 
 ### Paso 4 — Primer acceso a FreePBX
-Abre `http://localhost:8090`, completa el asistente, crea el usuario admin.
+Abre `http://IP_VM` (en VM con host networking, puerto 80 directo; ej.
+`http://192.168.18.93`), completa el asistente, crea el usuario admin.
 Habilita el módulo **API** (Admin → API) y crea una aplicación M2M (client_credentials)
 para el webhook. Detalle en `docs/PRIMER_ACCESO_FREEPBX.md`.
 
-### Paso 5 — Configurar midPoint
-1. `http://localhost:8081/midpoint` (usuario `administrator`; contraseña en
+> **Importante (host networking):** tras reiniciar el contenedor de FreePBX, si la
+> GUI muestra "Cannot Connect to Asterisk", ejecutar:
+> `docker exec telesecure_freepbx asterisk -rx "module reload manager"` seguido de
+> `docker exec telesecure_freepbx fwconsole chown && docker exec telesecure_freepbx fwconsole reload`.
+
+### Paso 5 — Permisos de BD para el webhook (IMPRESCINDIBLE)
+El webhook (`mp_user`) necesita permiso DML sobre la base `asterisk` de FreePBX para
+crear extensiones. Aplicar una vez:
+```bash
+docker exec -i telesecure_db mariadb -uroot -p"$DB_ROOT_PASSWORD" < db/grants-fase3.sql
+```
+Sin este paso, la provisión automática falla con `Access denied for user 'mp_user'`.
+
+### Paso 6 — Configurar midPoint
+1. `http://IP_VM:8081/midpoint` (usuario `administrator`; contraseña en
    `docker compose logs telesecure_midpoint | grep -i password`).
 2. **Importar objeto** → `midpoint/rol-agente-callcenter-4.10.xml` (Keep OID + Overwrite).
 3. **System Configuration → Edit raw** → insertar el contenido de
    `midpoint/notificador-FUNCIONANDO-4.10.xml` (notificador + transporte).
 
-### Paso 6 — Probar el flujo completo
+### Paso 7 — Probar el flujo completo
 Asigna el rol **AgenteCallCenter** a un usuario en midPoint. En segundos, la
 extensión SIP aparece en FreePBX:
 ```bash
-docker logs telesecure_webhook            # POST /provision 200 + extensión creada
+docker logs telesecure_webhook            # POST /provision 201 + extensión creada
 docker exec telesecure_freepbx asterisk -rx "pjsip show auths"
 ```
 
@@ -166,3 +187,10 @@ docker exec telesecure_freepbx asterisk -rx "pjsip show endpoint 1001"  # media_
 - **Certificado TLS autofirmado:** válido para laboratorio; producción usaría una CA
   reconocida (Let's Encrypt, soportado por la misma pantalla de FreePBX).
 
+---
+
+## 9. Seguridad del repositorio
+
+⚠️ El `.env`, `keystore_password.txt` y `repo_password.txt` contienen credenciales
+de **laboratorio**. El `.gitignore` ya excluye `.env`. **No publiques credenciales
+reales en repositorios públicos.**

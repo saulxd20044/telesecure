@@ -129,6 +129,9 @@ services:
     container_name: telesecure_freepbx
     restart: unless-stopped
     network_mode: host                  # <<<<<< comparte la red de la VM directamente
+    cap_add:
+      - SYS_NICE
+      - NET_ADMIN
     depends_on:
       db:
         condition: service_healthy
@@ -192,7 +195,7 @@ services:
       WEBHOOK_TOKEN: ${WEBHOOK_TOKEN:-CAMBIAR_TOKEN_WEBHOOK}
       FREEPBX_CONTAINER: telesecure_freepbx
       # FreePBX esta en host networking -> se alcanza por la IP de la VM
-      FREEPBX_API_BASE: http://192.168.18.93
+      FREEPBX_API_BASE: ${FREEPBX_API_BASE}
       FREEPBX_CLIENT_ID: ${FREEPBX_CLIENT_ID:-}
       FREEPBX_CLIENT_SECRET: ${FREEPBX_CLIENT_SECRET:-}
     volumes:

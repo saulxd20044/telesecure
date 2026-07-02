@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from panoramisk import Manager
 from typing import Optional, List
-
+import subprocess
 
 # 1. Leer variables de entorno
 AMI_HOST = os.getenv("AMI_HOST", "asterisk")
@@ -283,3 +283,115 @@ def obtener_transcripciones(limit: int = 20):
     finally:
         if 'connection' in locals() and connection.open:
             connection.close()
+
+
+async def obtener_extensiones_online():
+    global ami_manager
+
+    if ami_manager is None:
+        return 0
+
+    try:
+        response = await ami_manager.send_action({
+            "Action": "Command",
+            "Command": "pjsip show contacts"
+        })
+
+        if hasattr(response, "Output"):
+            if isinstance(response.Output, list):
+                salida = "\n".join(response.Output)
+            else:
+                salida = str(response.Output)
+
+        elif hasattr(response, "content"):
+            salida = response.content
+
+        else:
+            salida = str(response)
+
+        return sum(
+            1
+            for linea in salida.splitlines()
+            if "Avail" in linea
+        )
+
+    except Exception as e:
+        print(e)
+        return 0
+
+@app.get("/api/metrics")
+async  def obtener_metricas_dashboard():
+    try:
+        metrics = {
+            "total_extensions": 0,
+            "connected_extensions": 0,
+            "total_calls": 0,
+            "answered_calls": 0,
+            "failed_calls": 0,
+            "avg_duration_seconds": 0,
+            "calls_chart_data": [] # Datos limpios para los gráficos
+        }
+
+        # 1. Métricas de Extensiones (Base de Datos 'asterisk')
+        conn_ast = pymysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME,
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        with conn_ast.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) as total FROM devices")
+            res = cursor.fetchone()
+            metrics["total_extensions"] = res["total"] if res else 0
+        conn_ast.close()
+
+        # Extensiones conectadas en tiempo real
+        metrics["connected_extensions"] = await obtener_extensiones_online()
+
+        # 2. Métricas de Llamadas e Historial (Base de Datos 'asteriskcdrdb')
+        conn_cdr = pymysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database='asteriskcdrdb',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        with conn_cdr.cursor() as cursor:
+            # Totales generales del día/mes
+            sql_generales = """
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN disposition = 'ANSWERED' THEN 1 ELSE 0 END) as answered,
+                    SUM(CASE WHEN disposition IN ('NO ANSWER', 'FAILED', 'BUSY') THEN 1 ELSE 0 END) as failed,
+                    ROUND(AVG(billsec), 1) as avg_duration
+                FROM cdr 
+                WHERE calldate >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+            """
+            cursor.execute(sql_generales)
+            res_gen = cursor.fetchone()
+            if res_gen and res_gen["total"] > 0:
+                metrics["total_calls"] = res_gen["total"]
+                metrics["answered_calls"] = res_gen["answered"] or 0
+                metrics["failed_calls"] = res_gen["failed"] or 0
+                metrics["avg_duration_seconds"] = float(res_gen["avg_duration"] or 0)
+
+            # 3. Datos agrupados por fecha para el GRÁFICO (Últimos 7 días)
+            sql_grafico = """
+                SELECT 
+                    DATE_FORMAT(calldate, '%Y-%m-%d') as fecha,
+                    COUNT(*) as cantidad,
+                    SUM(CASE WHEN disposition = 'ANSWERED' THEN 1 ELSE 0 END) as contestadas
+                FROM cdr
+                WHERE calldate >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                GROUP BY DATE_FORMAT(calldate, '%Y-%m-%d')
+                ORDER BY fecha ASC
+            """
+            cursor.execute(sql_grafico)
+            metrics["calls_chart_data"] = cursor.fetchall()
+
+        conn_cdr.close()
+        return metrics
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error recopilando métricas: {str(e)}")

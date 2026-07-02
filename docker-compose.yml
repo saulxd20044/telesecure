@@ -90,6 +90,29 @@ services:
       - MP_INIT_CFG=/opt/midpoint/var
     networks:
       - red_datos
+      
+  telesecure_ai_listener:
+    build: ./transcripcion
+    container_name: telesecure_ai_listener
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - red_datos
+      - red_gestion
+    environment:
+      DB_HOST: "db"
+      DB_PORT: 3306
+      DB_NAME: "asteriskcdrdb"
+      DB_USER: "${FREEPBX_DB_USER:-fpbx_user}"
+      DB_PASS: "${FREEPBX_DB_PASSWORD:-FreepbxCambiar123!}"
+      DB_PASSWORD: "${FREEPBX_DB_PASSWORD:-FreepbxCambiar123!}"
+    volumes:
+      # Mapeo directo de la carpeta de audios de FreePBX en modo lectura
+      - asterisk_monitor_data:/var/spool/asterisk/monitor:ro
+    restart: always
 
   # -------------------------------------------------------------------
   # 2c) midPoint (IAM)
@@ -129,9 +152,6 @@ services:
     container_name: telesecure_freepbx
     restart: unless-stopped
     network_mode: host                  # <<<<<< comparte la red de la VM directamente
-    cap_add:
-      - SYS_NICE
-      - NET_ADMIN
     depends_on:
       db:
         condition: service_healthy
@@ -159,14 +179,14 @@ services:
       AMPSBIN: /usr/sbin
       AMPCGIBIN: /var/www/cgi-bin
       AMPPLAYBACK: /var/lib/asterisk/playback
-    # SIN 'ports:' — host networking expone los puertos directo en la VM
-    # SIN 'networks:' — comparte la red del host
     volumes:
       - freepbx_varlib:/var/lib/asterisk
       - freepbx_etc:/etc/asterisk
       - freepbx_usrlib:/usr/lib64/asterisk
       - freepbx_logs:/var/log/asterisk
       - freepbx_www:/var/www/html
+      - asterisk_monitor_data:/var/spool/asterisk/monitor
+      - /home/jeanpier/telesecure/odbc.ini:/etc/odbc.ini
     healthcheck:
       test: ["CMD-SHELL", "fwconsole --version > /dev/null 2>&1 || exit 1"]
       interval: 30s
@@ -208,7 +228,52 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
+# -------------------------------------------------------------------
+  # 5a) DASHBOARD BACKEND — FastAPI
+  # -------------------------------------------------------------------
+  dashboard_api:
+    build:
+      context: ./dashboard-api
+    container_name: telesecure_dashboard_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DB_HOST=db
+      - DB_PORT=3306
+      - DB_NAME=asterisk
+      - DB_USER=${FREEPBX_DB_USER:-fpbx_user}
+      - DB_PASSWORD=${FREEPBX_DB_PASSWORD:-FreepbxCambiar123!}
+      - JWT_SECRET=${JWT_SECRET:-CambiameEsteTokenSecreto123!}
+      - AMI_HOST=${AMI_HOST}
+      - AMI_PORT=${AMI_PORT}
+      - AMI_USER=${AMI_USER}
+      - AMI_SECRET=${AMI_SECRET}
+    networks:
+      - red_datos
+      - red_gestion
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./dashboard-api:/app
 
+  # -------------------------------------------------------------------
+  # 5b) DASHBOARD FRONTEND — Next.js
+  # -------------------------------------------------------------------
+  dashboard_web:
+    build:
+      context: ./dashboard-web
+    container_name: telesecure_dashboard_web
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    networks:
+      - red_gestion
+    ports:
+      - "3000:3000"
 # =====================================================================
 # REDES SEGMENTADAS
 # =====================================================================
@@ -227,6 +292,8 @@ networks:
 # VOLÚMENES PERSISTENTES
 # =====================================================================
 volumes:
+  asterisk_monitor_data:
+    name: telesecure_asterisk_monitor_data
   db_data:
     name: telesecure_db_data
   midpoint_home_v4:
